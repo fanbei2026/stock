@@ -5,6 +5,8 @@ import numpy as np
 from datetime import datetime, timedelta
 import time
 import warnings
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 warnings.filterwarnings("ignore")
 
 # ============ 配置区 ============
@@ -12,30 +14,73 @@ BARK_URL = "https://api.day.app/ZBYeYosX5gDpZLnczrpoGT"
 
 # 筛选参数
 MIN_AMOUNT = 1e8           # 日均成交额下限：1亿
-MIN_TURNOVER = 5.0         # 换手率下限：5%（接口返回单位是%）
+MIN_TURNOVER = 5.0         # 换手率下限：5%
 MAX_TURNOVER = 15.0        # 换手率上限：15%
-MIN_VOL_RATIO = 1.5        # 量比下限（价量共振核心因子）
+MIN_VOL_RATIO = 1.5        # 量比下限
 MIN_MARGIN_RATIO = 0.05    # 融资余额占流通市值比例下限：5%
 MAX_MARGIN_RATIO = 0.10    # 融资余额占流通市值比例上限：10%
-MIN_PE = 5                 # PE下限（排除亏损和极低估值陷阱）
-MAX_PE = 60                # PE上限（排除高估值泡沫）
+MIN_PE = 5                 # PE下限
+MAX_PE = 60                # PE上限
 MIN_PB = 0.5               # PB下限
 MAX_PB = 10                # PB上限
 TOP_N = 3                  # 最终推送股票数量
 MAX_CANDIDATES = 80        # 深度分析最大候选数
 
+# ============ 全局 Session（防封核心）============
+def create_session():
+    """创建带重试和伪装头的全局Session"""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    })
+    return session
+
+SESSION = create_session()
+
+def safe_request(func, *args, retries=3, delay=5, **kwargs):
+    """通用重试包装器，用于akshare等第三方库调用"""
+    for attempt in range(retries):
+        try:
+            result = func(*args, **kwargs)
+            return result
+        except Exception as e:
+            print(f"    第{attempt+1}次尝试失败: {e}")
+            if attempt < retries - 1:
+                wait = delay * (attempt + 1)
+                print(f"    等待{wait}秒后重试...")
+                time.sleep(wait)
+            else:
+                print(f"    全部{retries}次尝试均失败，跳过")
+                return None
+
 def push_bark(title, msg):
     """通过Bark推送消息到iPhone"""
     try:
         url = f"{BARK_URL}/{title}"
-        requests.get(url, params={
+        resp = SESSION.get(url, params={
             "body": msg,
             "group": "选股通知",
             "sound": "minuet.caf"
-        }, timeout=10)
-        print(f"✅ 推送成功")
+        }, timeout=15)
+        if resp.status_code == 200:
+            print(f"✅ 推送成功")
+        else:
+            print(f"❌ 推送失败: HTTP {resp.status_code}")
     except Exception as e:
-        print(f"❌ 推送失败: {e}")
+        print(f"❌ 推送异常: {e}")
 
 # ============ 第一步：批量获取融资融券数据 ============
 def load_margin_data():
@@ -44,14 +89,12 @@ def load_margin_data():
     返回: dict，key=股票代码, value=融资余额(元)
     """
     margin_dict = {}
-    today = datetime.now().strftime('%Y%m%d')
     
     # 尝试最近5个交易日（处理周末/节假日）
     for offset in range(5):
         date_str = (datetime.now() - timedelta(days=offset)).strftime('%Y%m%d')
         try:
-            # 沪市
-            sh_df = ak.stock_margin_detail_sse(date=date_str)
+            sh_df = safe_request(ak.stock_margin_detail_sse, date=date_str)
             if sh_df is not None and not sh_df.empty:
                 for _, row in sh_df.iterrows():
                     code = str(row.get('证券代码', '')).strip()
@@ -64,13 +107,12 @@ def load_margin_data():
             print(f"  沪市 {date_str} 数据获取失败: {e}")
             continue
     
-    time.sleep(1)
+    time.sleep(2)
     
     for offset in range(5):
         date_str = (datetime.now() - timedelta(days=offset)).strftime('%Y%m%d')
         try:
-            # 深市
-            sz_df = ak.stock_margin_detail_szse(date=date_str)
+            sz_df = safe_request(ak.stock_margin_detail_szse, date=date_str)
             if sz_df is not None and not sz_df.empty:
                 for _, row in sz_df.iterrows():
                     code = str(row.get('证券代码', '')).strip()
@@ -96,7 +138,7 @@ def get_market_pcr():
     返回: PCR值，获取失败返回None
     """
     try:
-        df = ak.option_finance_board(symbol="华夏上证50ETF期权")
+        df = safe_request(ak.option_finance_board, symbol="华夏上证50ETF期权")
         if df is None or df.empty:
             return None
         
@@ -123,7 +165,11 @@ def coarse_filter():
     直接从 stock_zh_a_spot_em 获取 PE/PB/量比/换手率/成交额/流通市值
     """
     print("正在获取A股实时行情...")
-    df = ak.stock_zh_a_spot_em()
+    df = safe_request(ak.stock_zh_a_spot_em)
+    if df is None or df.empty:
+        print("❌ 获取实时行情失败")
+        return pd.DataFrame()
+    
     print(f"  全市场共 {len(df)} 只股票")
     
     # 排除ST、退市
@@ -137,7 +183,7 @@ def coarse_filter():
     df['成交额'] = pd.to_numeric(df['成交额'], errors='coerce')
     df = df[df['成交额'] >= MIN_AMOUNT]
     
-    # 换手率 5%~15%（接口返回单位已经是%）
+    # 换手率 5%~15%
     df['换手率'] = pd.to_numeric(df['换手率'], errors='coerce')
     df = df[(df['换手率'] >= MIN_TURNOVER) & (df['换手率'] <= MAX_TURNOVER)]
     
@@ -145,11 +191,11 @@ def coarse_filter():
     df['量比'] = pd.to_numeric(df['量比'], errors='coerce')
     df = df[df['量比'] >= MIN_VOL_RATIO]
     
-    # PE为正且在合理区间（核心基本面因子）
+    # PE为正且在合理区间
     df['市盈率-动态'] = pd.to_numeric(df['市盈率-动态'], errors='coerce')
     df = df[(df['市盈率-动态'] >= MIN_PE) & (df['市盈率-动态'] <= MAX_PE)]
     
-    # PB在合理区间（核心基本面因子）
+    # PB在合理区间
     df['市净率'] = pd.to_numeric(df['市净率'], errors='coerce')
     df = df[(df['市净率'] >= MIN_PB) & (df['市净率'] <= MAX_PB)]
     
@@ -171,8 +217,10 @@ def check_stock_detail(symbol, name, margin_dict, pcr_value):
     """
     try:
         # ---- 获取日K数据 ----
-        daily = ak.stock_zh_a_hist(
-            symbol=symbol, period="daily",
+        daily = safe_request(
+            ak.stock_zh_a_hist,
+            symbol=symbol,
+            period="daily",
             start_date=(datetime.now() - timedelta(days=120)).strftime('%Y%m%d'),
             adjust="qfq"
         )
@@ -198,9 +246,7 @@ def check_stock_detail(symbol, name, margin_dict, pcr_value):
         vol_ma5 = daily['成交量'].rolling(5).mean().iloc[-1]
         
         if len(vol_3days) == 3:
-            # 逐日递增
             cond_a = vol_3days[0] < vol_3days[1] < vol_3days[2]
-            # 或至少比5日均量高20%
             cond_b = all(v > vol_ma5 * 1.2 for v in vol_3days)
             if not (cond_a or cond_b):
                 return None
@@ -216,41 +262,25 @@ def check_stock_detail(symbol, name, margin_dict, pcr_value):
         
         # ===== 多因子打分 =====
         
-        # --- 因子1: 量比（价量共振核心）---
-        # 量比越大，资金关注度越高
+        # --- 因子1: 量比 ---
         vol_ratio = last.get('量比', 1.5)
         if pd.isna(vol_ratio) or vol_ratio < MIN_VOL_RATIO:
             return None
-        score += min((vol_ratio - 1.5) * 8, 20)  # 最高加20分
-        
-        # --- 因子2: 融资余额占流通市值比例 ---
-        margin_balance = margin_dict.get(symbol, 0)
-        if margin_balance > 0:
-            # 流通市值从粗筛数据传入（这里用last的收盘价近似估算）
-            # 实际流通市值在粗筛阶段已经验证过，这里用日K数据近似
-            # 获取流通市值：从实时行情中传入
-            pass  # 融资余额评分在粗筛后的check中统一处理
-        
-        # --- 因子3: PE/PB基本面评分 ---
-        # PE在粗筛已过滤，这里做精细评分
-        # PE 15~30 最优区间
-        pe = last.get('市盈率-动态', 0)
-        # 注意：日K数据中没有PE字段，PE从粗筛数据中获取
-        # 这里通过量价关系间接评估
+        score += min((vol_ratio - 1.5) * 8, 20)
         
         # --- 因子4: PCR辅助加分 ---
         if pcr_value is not None:
             if 0.7 <= pcr_value <= 1.2:
-                score += 5  # 市场情绪中性偏好
+                score += 5
             elif pcr_value < 0.7:
-                score += 3  # 市场偏乐观
+                score += 3
         
         # --- 均线发散度（多头加速）---
         if len(daily) >= 25:
             spread_now = (last['ma5'] - last['ma20']) / last['ma20']
             spread_prev = (daily['ma5'].iloc[-5] - daily['ma20'].iloc[-5]) / daily['ma20'].iloc[-5]
             if spread_now > spread_prev:
-                score += 10  # 多头在加速发散
+                score += 10
         
         # --- 阳线强度 ---
         score += min((yang - 10) * 2, 10)
@@ -302,7 +332,6 @@ def main():
             if not (MIN_MARGIN_RATIO <= margin_ratio <= MAX_MARGIN_RATIO):
                 continue
         else:
-            # 没有融资数据的股票，不强制排除，但不加分
             margin_ratio = 0
         
         analyzed += 1
@@ -315,21 +344,20 @@ def main():
             # 融资余额加分
             if MIN_MARGIN_RATIO <= margin_ratio <= MAX_MARGIN_RATIO:
                 score += 15
-                # 靠近7%~8%最优区间额外加分
                 if 0.07 <= margin_ratio <= 0.08:
                     score += 5
             
             # PE精细评分
             pe = float(row.get('市盈率-动态', 0))
             if 15 <= pe <= 30:
-                score += 10  # PE最优区间
+                score += 10
             elif 10 <= pe < 15 or 30 < pe <= 40:
                 score += 5
             
             # PB精细评分
             pb = float(row.get('市净率', 0))
             if 1 <= pb <= 3:
-                score += 10  # PB最优区间
+                score += 10
             elif 3 < pb <= 5:
                 score += 5
             
@@ -351,7 +379,7 @@ def main():
             print("❌ 未通过")
         
         # 礼貌延迟，避免被封
-        time.sleep(0.3)
+        time.sleep(0.5)
     
     # 5. 排序取Top3
     results.sort(key=lambda x: x['评分'], reverse=True)
