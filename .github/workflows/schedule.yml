@@ -3,7 +3,6 @@ name: Stock Alert
 on:
   schedule:
     # 北京时间每个交易日15:05运行（UTC时间7:05）
-    # 收盘后运行，数据更完整
     - cron: '5 7 * * 1-5'
   workflow_dispatch:  # 支持手动触发
 
@@ -21,7 +20,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install akshare requests pandas numpy
+          pip install akshare requests pandas numpy urllib3
 
       - name: Run stock alert
         run: |
