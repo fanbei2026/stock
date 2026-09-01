@@ -1,0 +1,28 @@
+name: Stock Alert
+
+on:
+  schedule:
+    # 北京时间每个交易日15:05运行（UTC时间7:05）
+    # 收盘后运行，数据更完整
+    - cron: '5 7 * * 1-5'
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install akshare requests pandas numpy
+
+      - name: Run stock alert
+        run: |
+          python stock_alert.py
