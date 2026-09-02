@@ -1,339 +1,172 @@
-import akshare as ak
-import pandas as pd
-import numpy as np
-import requests
-import json
+# -*- coding: utf-8 -*-
+"""
+波段选股脚本
+数据源：AKShare（东方财富）
+推送渠道：Bark
+"""
+
 import os
-import warnings
-from datetime import datetime, timedelta
+import sys
+import akshare as ak
+import requests
+from datetime import datetime
 
-warnings.filterwarnings('ignore')
+# ============ 配置区 ============
+# Bark 推送地址（从 GitHub Secrets 读取）
+BARK_URL = os.environ.get("BARK_URL", "")
+BARK_KEY = os.environ.get("BARK_KEY", "")  # Bark的密钥
 
-# ==================== 配置区（已填入你的BARK地址） ====================
-BARK_URL = "https://api.day.app"
-BARK_KEY = "ZBYeYosX5gDpZLnczrpoGT"
-BARK_GROUP_SELECT = "波段选股"
-BARK_GROUP_ALERT = "波段持仓监控"
-BARK_WEBHOOK = "https://your-webhook-url.com/bark"  # Bark快捷按钮的Webhook地址（部署后替换）
-
-# 止盈止损参数
-TAKE_PROFIT_PCT = 0.08       # 止盈比例 8%
-STOP_LOSS_PCT = -0.05        # 止损比例 -5%
-TRAILING_START_PCT = 0.05    # 盈利超5%后启动移动止损
-TRAILING_STOP_PCT = -0.03    # 移动止损回撤3%即卖出
-
-POSITIONS_FILE = "positions.json"
-# ===================================================================
+# 选股条件（可根据自己策略调整）
+MIN_CHANGE_PCT = 3.0    # 最小涨幅 %
+MAX_CHANGE_PCT = 9.5    # 最大涨幅 %（排除涨停）
+MIN_TURNOVER = 2.0      # 最小换手率 %
+MIN_VOLUME_RATIO = 1.5  # 最小量比
+MAX_PRICE = 100.0       # 最高股价（排除高价股）
+MIN_PRICE = 3.0         # 最低股价（排除低价垃圾股）
+# ================================
 
 
-def send_bark(title, content="", group=BARK_GROUP_SELECT, action_url=None):
-    """推送消息到Bark"""
-    url = f"{BARK_URL}/{BARK_KEY}/{title}/{content}"
-    params = {"group": group, "badge": "1", "isArchive": "1"}
-    if action_url:
-        params["action"] = action_url
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        if resp.status_code == 200:
-            print(f"推送成功: {title}")
-        else:
-            print(f"推送失败: {resp.status_code} {resp.text}")
-    except Exception as e:
-        print(f"推送失败: {e}")
+def fetch_stock_data():
+    """获取A股实时行情数据（带重试）"""
+    print("正在获取A股实时行情...")
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            df = ak.stock_zh_a_spot_em()
+            print(f"✅ 成功获取 {len(df)} 只股票数据")
+            return df
+        except Exception as e:
+            print(f"⚠️ 第 {attempt} 次尝试失败: {e}")
+            if attempt < max_retries:
+                import time
+                time.sleep(2)
+    print("❌ 获取股票数据失败，已重试3次")
+    return None
 
 
-def load_positions():
-    """加载持仓记录"""
-    if os.path.exists(POSITIONS_FILE):
-        with open(POSITIONS_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return []
+def filter_stocks(df):
+    """根据波段选股条件筛选股票"""
+    if df is None or df.empty:
+        return []
 
+    selected = []
 
-def save_positions(positions):
-    """保存持仓记录"""
-    with open(POSITIONS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(positions, f, ensure_ascii=False, indent=2)
+    for _, row in df.iterrows():
+        try:
+            # 获取字段值（不同接口可能字段名略有不同）
+            code = str(row.get("代码", ""))
+            name = str(row.get("名称", ""))
+            price = float(row.get("最新价", 0))
+            change_pct = float(row.get("涨跌幅", 0))
+            turnover = float(row.get("换手率", 0))
+            volume_ratio = float(row.get("量比", 1.0))
 
+            # 排除ST股、退市股
+            if "ST" in name or "退" in name:
+                continue
 
-def add_position_local(code, name, buy_price, buy_date):
-    """本地添加持仓"""
-    positions = load_positions()
-    positions.append({
-        "code": code,
-        "name": name,
-        "buy_price": float(buy_price),
-        "buy_date": buy_date,
-        "max_price": float(buy_price)
-    })
-    save_positions(positions)
-    print(f"已添加持仓: {name}({code}) @ {buy_price}")
+            # 排除新股（代码以301/688开头且价格异常）
+            if code.startswith("301") or code.startswith("688"):
+                if price > 200:
+                    continue
 
-
-# ==================== 功能一：尾盘选股 ====================
-def get_stock_list():
-    """获取A股全部股票列表"""
-    df = ak.stock_zh_a_spot_em()
-    return df[['代码', '名称', '最新价', '成交额', '换手率', '量比', '流通市值']]
-
-
-def get_history_data(code):
-    """获取个股近期历史数据"""
-    try:
-        df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date="20260101", adjust="qfq")
-        if df is None or len(df) < 20:
-            return None
-        df = df[['日期', '开盘', '最高', '最低', '收盘', '成交量', '成交额']]
-        df.columns = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount']
-        df['close'] = df['close'].astype(float)
-        df['volume'] = df['volume'].astype(float)
-        return df
-    except:
-        return None
-
-
-def calc_indicators(df):
-    """计算技术指标"""
-    close = df['close'].values
-    df['MA5'] = pd.Series(close).rolling(5).mean()
-    df['MA10'] = pd.Series(close).rolling(10).mean()
-    ema12 = pd.Series(close).ewm(span=12, adjust=False).mean()
-    ema26 = pd.Series(close).ewm(span=26, adjust=False).mean()
-    df['DIF'] = ema12 - ema26
-    df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
-    df['MACD'] = (df['DIF'] - df['DEA']) * 2
-    high_9 = pd.Series(close).rolling(9).max()
-    low_9 = pd.Series(close).rolling(9).min()
-    rsv = (close - low_9) / (high_9 - low_9) * 100
-    df['K'] = pd.Series(rsv).ewm(com=2, adjust=False).mean()
-    df['D'] = df['K'].ewm(com=2, adjust=False).mean()
-    df['J'] = 3 * df['K'] - 2 * df['D']
-    df['VOL_MA5'] = df['volume'].rolling(5).mean()
-    return df
-
-
-def check_buy_signal(df):
-    """判断是否满足买入信号（波段起爆点）"""
-    if len(df) < 15:
-        return False, ""
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    reasons = []
-    if last['MA5'] > last['MA10'] and prev['MA5'] <= prev['MA10']:
-        reasons.append("MA5金叉MA10")
-    if last['volume'] > last['VOL_MA5'] * 1.5:
-        reasons.append("放量突破")
-    if last['K'] > last['D'] and prev['K'] <= prev['D'] and prev['J'] < 50:
-        reasons.append("KDJ低位金叉")
-    if last['MACD'] > prev['MACD'] and last['MACD'] > 0:
-        reasons.append("MACD走强")
-    if len(reasons) >= 2:
-        return True, " | ".join(reasons)
-    return False, ""
-
-
-def band_select():
-    """波段选股主函数 - 每天14:30执行"""
-    print(f"\n开始波段选股: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    try:
-        df_spot = get_stock_list()
-    except Exception as e:
-        send_bark("选股失败", f"获取股票列表异常: {e}", BARK_GROUP_SELECT)
-        return
-
-    df_spot = df_spot[
-        (df_spot['最新价'] < 20) &
-        (df_spot['最新价'] > 3) &
-        (df_spot['换手率'] > 3) &
-        (df_spot['换手率'] < 15) &
-        (df_spot['量比'] > 1.2) &
-        (df_spot['流通市值'] < 300)
-    ]
-
-    results = []
-    for _, row in df_spot.iterrows():
-        code = row['代码']
-        df_hist = get_history_data(code)
-        if df_hist is None:
-            continue
-        df_hist = calc_indicators(df_hist)
-        signal, reason = check_buy_signal(df_hist)
-        if signal:
-            results.append({
-                'code': code,
-                'name': row['名称'],
-                'price': row['最新价'],
-                'turnover': row['换手率'],
-                'volume_ratio': row['量比'],
-                'reason': reason
-            })
-            if len(results) >= 5:
-                break
-
-    if results:
-        msg = ""
-        for i, r in enumerate(results, 1):
-            msg += f"\n{i}. {r['name']}({r['code']}) {r['price']}"
-            msg += f"\n   换手{r['turnover']}% | 量比{r['volume_ratio']} | 信号:{r['reason']}"
-
-        send_bark(
-            f"波段选股 {datetime.now().strftime('%m.%d')}",
-            msg.strip(),
-            BARK_GROUP_SELECT,
-            action_url=BARK_WEBHOOK
-        )
-        print(f"筛选出 {len(results)} 只候选股")
-    else:
-        send_bark("波段选股 无信号", "今日无符合条件的波段标的", BARK_GROUP_SELECT)
-        print("无信号")
-
-
-# ==================== 功能二：持仓监控 ====================
-def get_realtime_price(code):
-    """获取个股实时价格"""
-    try:
-        df = ak.stock_zh_a_spot_em()
-        row = df[df['代码'] == code]
-        if len(row) == 0:
-            return None
-        return {
-            'name': row['名称'].values[0],
-            'price': float(row['最新价'].values[0]),
-            'change_pct': float(row['涨跌幅'].values[0]),
-            'high': float(row['最高'].values[0]),
-            'low': float(row['最低'].values[0])
-        }
-    except:
-        return None
-
-
-def band_monitor():
-    """持仓监控主函数 - 早盘9:35-10:00每5分钟执行"""
-    positions = load_positions()
-    if not positions:
-        print("无持仓，跳过监控")
-        return
-
-    print(f"持仓监控，共{len(positions)}只: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-
-    today = datetime.now().strftime('%Y-%m-%d')
-    alerts = []
-
-    for pos in positions:
-        code = pos['code']
-        name = pos['name']
-        buy_price = pos['buy_price']
-        max_price = pos['max_price']
-
-        realtime = get_realtime_price(code)
-        if not realtime:
+            # 波段选股条件
+            if MIN_CHANGE_PCT <= change_pct <= MAX_CHANGE_PCT:
+                if turnover >= MIN_TURNOVER:
+                    if volume_ratio >= MIN_VOLUME_RATIO:
+                        if MIN_PRICE <= price <= MAX_PRICE:
+                            selected.append({
+                                "code": code,
+                                "name": name,
+                                "price": price,
+                                "change_pct": change_pct,
+                                "turnover": turnover,
+                                "volume_ratio": volume_ratio,
+                            })
+        except (ValueError, TypeError):
+            # 数据异常的单只股票，跳过
             continue
 
-        current_price = realtime['price']
-        change_pct = realtime['change_pct']
+    # 按涨幅排序
+    selected.sort(key=lambda x: x["change_pct"], reverse=True)
+    return selected
 
-        if current_price > max_price:
-            pos['max_price'] = current_price
-            save_positions(positions)
-            max_price = current_price
 
-        profit_pct = (current_price - buy_price) / buy_price
+def send_bark(title, body, is_url=False):
+    """推送消息到 Bark"""
+    if not BARK_URL or not BARK_KEY:
+        print("⚠️ 未配置 BARK_URL 或 BARK_KEY，跳过推送")
+        return
 
-        action = ""
-        sell_reason = ""
+    url = f"{BARK_URL.rstrip('/')}/{BARK_KEY}"
+    payload = {
+        "title": title,
+        "body": body,
+        "badge": 1,
+        "group": "波段选股",
+        "sound": "minuet.caf",
+    }
 
-        if profit_pct >= TAKE_PROFIT_PCT:
-            action = "SELL"
-            sell_reason = f"止盈 +{profit_pct*100:.2f}%"
-        elif profit_pct <= STOP_LOSS_PCT:
-            action = "SELL"
-            sell_reason = f"止损 {profit_pct*100:.2f}%"
-        elif profit_pct >= TRAILING_START_PCT:
-            drawdown = (current_price - max_price) / max_price
-            if drawdown <= TRAILING_STOP_PCT:
-                action = "SELL"
-                sell_reason = f"移动止损（最高点回撤{abs(drawdown)*100:.2f}%）"
-
-        if action == "SELL":
-            alerts.append(f"{name}({code})\n买入价:{buy_price} -> 现价:{current_price}({change_pct:+.2f}%)\n{sell_reason}")
-            positions = [p for p in positions if p['code'] != code]
-            save_positions(positions)
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code == 200:
+            print("✅ 推送成功")
         else:
-            hold_days = (datetime.strptime(today, '%Y-%m-%d') - datetime.strptime(pos['buy_date'], '%Y-%m-%d')).days
-            alerts.append(f"{name}({code}) 持仓{hold_days}天 | 买入{buy_price} -> 现价{current_price}({profit_pct*100:+.2f}%)")
+            print(f"❌ 推送失败: {response.text}")
+    except Exception as e:
+        print(f"❌ 推送异常: {e}")
 
-    if alerts:
-        send_bark(
-            f"波段持仓 {datetime.now().strftime('%H:%M')}",
-            "\n\n".join(alerts),
-            BARK_GROUP_ALERT
+
+def format_message(selected):
+    """格式化选股结果消息"""
+    if not selected:
+        return "📊 今日暂无符合波段条件的标的\n\n条件：涨幅3%~9.5%、换手率≥2%、量比≥1.5"
+
+    lines = []
+    for i, s in enumerate(selected[:15], 1):  # 最多推送15只
+        lines.append(
+            f"{i}. {s['name']}（{s['code']}） "
+            f"涨幅{s['change_pct']:+.2f}% "
+            f"换手{s['turnover']:.1f}% "
+            f"量比{s['volume_ratio']:.1f}"
         )
 
+    msg = f"🎯 共筛选出 {len(selected)} 只标的\n\n" + "\n".join(lines)
+    if len(selected) > 15:
+        msg += f"\n\n（还有 {len(selected) - 15} 只，请在GitHub查看完整列表）"
 
-# ==================== 功能三：从Bark快捷按钮添加持仓 ====================
-def add_position_from_bark(code, name, price):
-    """从Bark快捷按钮添加持仓"""
-    add_position_local(code, name, price, datetime.now().strftime('%Y-%m-%d'))
-    send_bark(
-        "已登记持仓",
-        f"{name}({code}) 买入价: {price}\n日期: {datetime.now().strftime('%Y-%m-%d')}\n将在次日早盘自动监控止盈止损",
-        BARK_GROUP_ALERT
-    )
+    msg += f"\n\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    return msg
 
 
-# ==================== 入口 ====================
+def main():
+    print("=" * 50)
+    print(f"波段选股启动 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 50)
+
+    # 1. 获取数据
+    df = fetch_stock_data()
+    if df is None:
+        send_bark("选股失败 ❌", "获取股票数据失败，请检查网络或稍后重试。")
+        sys.exit(1)
+
+    # 2. 筛选
+    selected = filter_stocks(df)
+    print(f"筛选出 {len(selected)} 只符合条件的股票")
+
+    # 3. 推送
+    title = f"波段选股 {'✅' if selected else '⚪'}"
+    body = format_message(selected)
+    send_bark(title, body)
+
+    # 4. 输出完整列表（供GitHub Actions日志查看）
+    print("\n" + "=" * 50)
+    print("完整选股结果：")
+    print("=" * 50)
+    for s in selected:
+        print(f"  {s['code']} {s['name']} 涨{s['change_pct']:+.2f}% "
+              f"换手{s['turnover']:.1f}% 量比{s['volume_ratio']:.1f}")
+
+
 if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) > 1:
-        cmd = sys.argv[1]
-        if cmd == "select":
-            band_select()
-        elif cmd == "monitor":
-            band_monitor()
-        elif cmd == "add":
-            if len(sys.argv) >= 5:
-                add_position_local(sys.argv[2], sys.argv[3], sys.argv[4], datetime.now().strftime('%Y-%m-%d'))
-            else:
-                print("用法: python stock_band.py add <代码> <名称> <买入价>")
-        elif cmd == "list":
-            for p in load_positions():
-                print(f"{p['name']}({p['code']}) 买入价:{p['buy_price']} 日期:{p['buy_date']}")
-        elif cmd == "webhook":
-            from flask import Flask, request, jsonify
-            import re
-
-            app = Flask(__name__)
-
-            @app.route('/bark', methods=['POST'])
-            def bark_handler():
-                data = request.json
-                body = data.get('body', '') if data else ''
-                title = data.get('title', '') if data else ''
-
-                match = re.search(r'add:([0-9]{6}):([^:]+):([0-9.]+)', body)
-                if match:
-                    code = match.group(1)
-                    name = match.group(2).strip()
-                    price = match.group(3)
-                    add_position_from_bark(code, name, price)
-                    return jsonify({"status": "ok", "message": f"已添加: {name}({code})"})
-                else:
-                    match2 = re.search(r'([\u4e00-\u9fa5]+)\(([0-9]{6})\)\s*([0-9.]+)', body)
-                    if match2:
-                        name = match2.group(1)
-                        code = match2.group(2)
-                        price = match2.group(3)
-                        add_position_from_bark(code, name, price)
-                        return jsonify({"status": "ok", "message": f"已添加: {name}({code})"})
-                    else:
-                        return jsonify({"status": "error", "message": "无法解析股票信息"}), 400
-
-            print("Bark Webhook 服务已启动，监听端口 5000")
-            print("请将以下地址配置到 Bark 的 Webhook 设置中:")
-            print("http://localhost:5000/bark")
-            app.run(host='0.0.0.0', port=5000, debug=False)
-        else:
-            print("用法: python stock_band.py [select|monitor|add|list|webhook]")
-    else:
-        print("用法: python stock_band.py [select|monitor|add|list|webhook]")
+    main()
