@@ -16,9 +16,34 @@ on:
 jobs:
   add:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v3
-      - name: 添加持仓
+
+      - name: 添加持仓到 positions.json
         run: |
-          echo "添加持仓: ${{ github.event.inputs.name }}(${{ github.event.inputs.code }}) @ ${{ github.event.inputs.price }}"
-          echo "请在本地运行: python stock_band.py add ${{ github.event.inputs.code }} ${{ github.event.inputs.name }} ${{ github.event.inputs.price }}"
+          python3 -c "
+          import json
+          with open('positions.json', 'r') as f:
+              data = json.load(f)
+          new_item = {
+              'code': '${{ github.event.inputs.code }}',
+              'name': '${{ github.event.inputs.name }}',
+              'buy_price': float('${{ github.event.inputs.price }}'),
+              'buy_date': '$(date +%Y-%m-%d)',
+              'status': 'holding'
+          }
+          data.append(new_item)
+          with open('positions.json', 'w') as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+          print('已添加:', new_item)
+          "
+
+      - name: 提交更新
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add positions.json
+          git commit -m "添加持仓: ${{ github.event.inputs.name }}(${{ github.event.inputs.code }})"
+          git push
