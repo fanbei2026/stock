@@ -1,0 +1,24 @@
+name: 添加持仓
+
+on:
+  workflow_dispatch:
+    inputs:
+      code:
+        description: '股票代码（如 000001）'
+        required: true
+      name:
+        description: '股票名称（如 平安银行）'
+        required: true
+      price:
+        description: '买入价格（如 12.50）'
+        required: true
+
+jobs:
+  add:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: 添加持仓
+        run: |
+          echo "添加持仓: ${{ github.event.inputs.name }}(${{ github.event.inputs.code }}) @ ${{ github.event.inputs.price }}"
+          echo "请在本地运行: python stock_band.py add ${{ github.event.inputs.code }} ${{ github.event.inputs.name }} ${{ github.event.inputs.price }}"
