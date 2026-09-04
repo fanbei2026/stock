@@ -1,117 +1,151 @@
 import akshare as ak
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
 import requests
+from datetime import datetime
 import warnings
 warnings.filterwarnings("ignore")
 
 # ============ 1. 个人配置区 ============
 BARK_URL = "https://api.day.app/ZBYeYosX5gDpZLnczrpoGT"
 
-# 筛选参数（可根据需要调整）
-MIN_AMOUNT = 1e8           # 成交额下限：1亿
-MIN_TURNOVER = 5.0         # 换手率下限：5%
-MAX_TURNOVER = 15.0        # 换手率上限：15%
-MIN_VOL_RATIO = 1.5        # 量比下限
-MIN_PE = 5                 # PE下限
-MAX_PE = 60                # PE上限
-MIN_PB = 0.5               # PB下限
-MAX_PB = 10                # PB上限
+# 筛选参数
+MIN_AMOUNT = 1e8           # 成交额 >= 1亿
+MIN_TURNOVER = 5.0         # 换手率 >= 5%
+MAX_TURNOVER = 15.0        # 换手率 <= 15%
+MIN_VOL_RATIO = 1.5        # 量比 >= 1.5
+MIN_PE = 5                 # PE >= 5
+MAX_PE = 60                # PE <= 60
+MIN_PB = 0.5               # PB >= 0.5
+MAX_PB = 10                # PB <= 10
 
-# ============ 2. 核心工具 ============
-def push_bark(title, msg):
-    """推送消息到iPhone"""
+# ============ 2. Bark推送函数 ============
+def push_bark(title, content):
     try:
-        requests.get(f"{BARK_URL}/{title}", params={
-            "body": msg, "group": "选股通知", "sound": "minuet.caf"
-        }, timeout=10)
-        print(f"✅ 推送成功")
-    except Exception as e:
-        print(f"❌ 推送失败: {e}")
-
-def safe_request(func, **kwargs):
-    """带超时控制的请求包装，防止GitHub卡死"""
-    try:
-        # 设置15秒超时，拿不到数据直接报错返回None
-        return func(**kwargs)
-    except Exception:
-        return None
-
-# ============ 3. 选股逻辑 ============
-def run_stock_filter():
-    print(f"🚀 选股系统启动: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    
-    # 第一步：获取实时行情
-    print("正在获取A股实时行情...")
-    df = safe_request(ak.stock_zh_a_spot_em)
-    if df is None or df.empty:
-        push_bark("选股失败", "实时行情获取失败，请检查网络")
-        return
-
-    # 排除ST、停牌和退市
-    df = df[~df['名称'].str.contains('ST|退|停牌', na=False)]
-    df['最新价'] = pd.to_numeric(df['最新价'], errors='coerce')
-    df = df[df['最新价'] > 0]
-
-    # 第二步：硬性条件筛选
-    df['成交额'] = pd.to_numeric(df['成交额'], errors='coerce')
-    df = df[df['成交额'] >= MIN_AMOUNT]  # 成交额 > 1亿
-
-    df['换手率'] = pd.to_numeric(df['换手率'], errors='coerce')
-    df = df[(df['换手率'] >= MIN_TURNOVER) & (df['换手率'] <= MAX_TURNOVER)]
-
-    df['量比'] = pd.to_numeric(df['量比'], errors='coerce')
-    df = df[df['量比'] >= MIN_VOL_RATIO] # 量比 > 1.5
-
-    df['市盈率-动态'] = pd.to_numeric(df['市盈率-动态'], errors='coerce')
-    df = df[(df['市盈率-动态'] >= MIN_PE) & (df['市盈率-动态'] <= MAX_PE)]
-
-    df['市净率'] = pd.to_numeric(df['市净率'], errors='coerce')
-    df = df[(df['市净率'] >= MIN_PB) & (df['市净率'] <= MAX_PB)]
-
-    # 涨幅限制在 1% ~ 9%（排除涨停，寻找刚启动的）
-    df['涨跌幅'] = pd.to_numeric(df['涨跌幅'], errors='coerce')
-    df = df[(df['涨跌幅'] >= 1.0) & (df['涨跌幅'] <= 9.0)]
-
-    if df.empty:
-        push_bark("今日无推荐", "粗筛无符合条件的股票")
-        return
-
-    print(f"粗筛通过: {len(df)} 只")
-
-    # 第三步：对粗筛通过的股票进行技术面精筛
-    final_results = []
-    for _, row in df.head(30).iterrows(): # 只精筛粗筛的前30只，节省时间
-        code = str(row['代码'])
-        name = row['名称']
-        
-        # 获取近60天历史数据
-        hist = safe_request(
-            ak.stock_zh_a_hist, symbol=code, 
-            period="daily", start_date=(datetime.now() - timedelta(days=60)).strftime('%Y%m%d'), adjust="qfq"
+        requests.get(
+            f"{BARK_URL}/{title}/{content}",
+            timeout=5
         )
-        
-        if hist is None or len(hist) < 30:
-            continue
-            
-        # 均线多头判断 (5日线 > 20日线)
-        hist['收盘'] = pd.to_numeric(hist['收盘'])
-        ma5 = hist['收盘'].tail(5).mean()
-        ma20 = hist['收盘'].tail(20).mean()
-        
-        if ma5 > ma20 and row['最新价'] > ma5:
-            final_results.append(f"【{name}】{code} | 涨幅:{row['涨跌幅']}% | 换手率:{row['换手率']}% | 量比:{row['量比']}")
-            if len(final_results) >= 3: # 最多推送3只
-                break
+    except Exception as e:
+        print(f"推送失败: {e}")
 
-    # 第四步：推送结果
-    if final_results:
-        msg = "\n".join(final_results)
-        push_bark("🎯 今日精选好股", msg)
-        print("✅ 筛选并推送完成")
-    else:
-        push_bark("今日无推荐", "精筛阶段无符合条件的股票")
+# ============ 3. 主程序 ============
+def main():
+    today = datetime.now().strftime("%Y-%m-%d")
+    print(f"运行时间: {today}")
+
+    # ---- 尝试获取东方财富A股实时行情 ----
+    try:
+        print("正在获取东方财富实时行情...")
+        # 使用akshare的东方财富实时行情接口
+        df = ak.stock_zh_a_spot_em()
+    except requests.exceptions.Timeout:
+        push_bark("选股失败", f"原因：网络超时，GitHub连不上东方财富服务器，请稍后手动重试。")
+        return
+    except requests.exceptions.ConnectionError:
+        push_bark("选股失败", f"原因：网络连接被拒绝，可能是东方财富接口临时维护。")
+        return
+    except Exception as e:
+        push_bark("选股失败", f"原因：数据获取异常 — {str(e)[:50]}")
+        return
+
+    # ---- 检查数据是否为空 ----
+    if df is None or df.empty:
+        push_bark("选股失败", "原因：拿到了空数据，东方财富接口可能正在维护中。")
+        return
+
+    print(f"成功获取 {len(df)} 只股票数据")
+
+    # ---- 数据清洗：统一列名 ----
+    try:
+        # akshare东方财富接口返回的列名
+        df.rename(columns={
+            "最新价": "price",
+            "涨跌幅": "pct_change",
+            "涨跌额": "change",
+            "成交量": "volume",
+            "成交额": "amount",
+            "振幅": "amplitude",
+            "最高": "high",
+            "最低": "low",
+            "今开": "open",
+            "昨收": "prev_close",
+            "量比": "vol_ratio",
+            "换手率": "turnover",
+            "市盈率-动态": "pe",
+            "市净率": "pb",
+            "总市值": "total_mv",
+            "流通市值": "circ_mv",
+            "涨速": "speed",
+            "60日涨跌幅": "pct_60d",
+            "年初至今涨跌幅": "pct_ytd",
+            "代码": "code",
+            "名称": "name",
+        }, inplace=True)
+    except Exception:
+        pass  # 列名映射失败不影响后续
+
+    # ---- 确保数值列为数字类型 ----
+    for col in ["amount", "turnover", "vol_ratio", "pe", "pb"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # ---- 开始筛选 ----
+    try:
+        result = df.copy()
+
+        # 去除停牌股票（最新价为0或NaN）
+        result = result[result["price"] > 0]
+
+        # 条件筛选
+        if "amount" in result.columns:
+            result = result[result["amount"] >= MIN_AMOUNT]
+        if "turnover" in result.columns:
+            result = result[result["turnover"] >= MIN_TURNOVER]
+            result = result[result["turnover"] <= MAX_TURNOVER]
+        if "vol_ratio" in result.columns:
+            result = result[result["vol_ratio"] >= MIN_VOL_RATIO]
+        if "pe" in result.columns:
+            result = result[result["pe"] >= MIN_PE]
+            result = result[result["pe"] <= MAX_PE]
+        if "pb" in result.columns:
+            result = result[result["pb"] >= MIN_PB]
+            result = result[result["pb"] <= MAX_PB]
+    except Exception as e:
+        push_bark("选股失败", f"原因：数据格式解析错误 — {str(e)[:50]}")
+        return
+
+    # ---- 判断筛选结果 ----
+    if len(result) == 0:
+        push_bark(
+            "选股失败",
+            f"原因：获取了 {len(df)} 只股票，但没有一只满足你的筛选条件。\n"
+            f"建议：适当放宽条件（如换手率下限、量比下限）。"
+        )
+        return
+
+    # ---- 排序输出 ----
+    # 按成交额降序排列
+    result = result.sort_values(by="amount", ascending=False).head(20)
+
+    # 构建推送内容
+    msg = f"共选出 {len(result)} 只股票：\n\n"
+    for i, row in result.iterrows():
+        name = row.get("name", "未知")
+        code = row.get("code", "未知")
+        price = row.get("price", 0)
+        pct = row.get("pct_change", 0)
+        turnover = row.get("turnover", 0)
+        vol_ratio = row.get("vol_ratio", 0)
+        pe = row.get("pe", 0)
+        pb = row.get("pb", 0)
+
+        msg += f"🔔 {name}({code})\n"
+        msg += f"  价格: {price}  涨跌: {pct}%\n"
+        msg += f"  换手: {turnover}%  量比: {vol_ratio}\n"
+        msg += f"  PE: {pe}  PB: {pb}\n\n"
+
+    push_bark("选股结果", msg)
+    print(f"成功推送 {len(result)} 只股票")
 
 if __name__ == "__main__":
-    run_stock_filter()
+    main()
